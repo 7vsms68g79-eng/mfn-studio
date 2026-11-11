@@ -611,6 +611,7 @@ input,textarea,[contenteditable]{text-transform:none!important;}
 #mfnBanner .btn{padding:7px 12px;color:#333;border-color:rgba(0,0,0,0.18);}
 #mfnBanner .btnp{background:#000;border-color:#000;color:#fff;}
 .bk-info{font-size:10px;color:var(--text3);margin-top:10px;letter-spacing:0.04em;line-height:1.75;max-width:560px;}
+img.m-missing{visibility:hidden;}
 </style>
 </head>
 <body>
@@ -740,7 +741,7 @@ input,textarea,[contenteditable]{text-transform:none!important;}
 
 <div id="lightbox"><img id="lightboxImg" src="" alt=""><div id="lbClose">✕</div></div>
 <script>
-const APP_VERSION="2026.11.11-1"; // bei jedem Update erhoehen (loest den Update-Hinweis aus)
+const APP_VERSION="2026.11.11-2"; // bei jedem Update erhoehen (loest den Update-Hinweis aus)
 const SK="mfn_v8";
 const DEF={
   sec:null,sub:null,season:"fw28",sidebarOpen:true,openAccs:[],tabsHidden:false,
@@ -838,24 +839,37 @@ function save(){
 /* ══════════════════════════════════════════════════════════════════
    MEDIENSPEICHER — Bilder & Dateien
    Jede Datei liegt als eigener Eintrag in IndexedDB, unveraendert im
-   Original. Im Zustand S steht nur ein kurzer Verweis ("mfnm:<id>").
-   Speichern, Tippen und "Rueckgaengig" bleiben dadurch gleich schnell,
-   egal wie viele Bilder hinterlegt sind.
-   Fuer sehr grosse Fotos entsteht zusaetzlich eine Vorschau in voller
+   Original, als reine Bytes (ArrayBuffer). Safari kann als "Blob"
+   gespeicherte Dateien nach einem Neustart oft nicht mehr lesen —
+   reine Bytes sind dort zuverlaessig.
+   Im Zustand S steht nur ein kurzer Verweis ("mfnm:<id>").
+   Geladen wird erst, wenn ein Bild sichtbar wird; der Start bleibt
+   dadurch gleich schnell, egal wie viele Bilder hinterlegt sind.
+   Fuer sehr grosse Fotos gibt es zusaetzlich eine Vorschau in voller
    Bildschirmschaerfe (kuerzere Kante 2000 px) — nur fuer die Kacheln.
    Vergroessern, Oeffnen, Speichern und Backup nutzen immer das Original.
    ══════════════════════════════════════════════════════════════════ */
 const MSTORE="media",TSTORE="thumbs",MREF="mfnm:";
 const THUMB_SHORT=2000,THUMB_FROM=2600;
-const _mFull=new Map(),_mThumb=new Map();
+const M_PH="data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
+const M_CACHE_MAX=400*1048576; // so viel Bilddaten halten wir hoechstens gleichzeitig bereit
+const _mIds=new Set(),_mThumbIds=new Set(),_mBad=new Set();
+const _mUrl=new Map(),_mBytes=new Map(),_mJobs=new Map();
 let _mediaOK=false,_stateSrc="def";
 function isMRef(v){return typeof v==="string"&&v.lastIndexOf(MREF,0)===0;}
 function mId(v){return String(v).slice(MREF.length);}
+function mPh(k){return M_PH+"#"+k;}
+function mGetUrl(k){
+  const id=k.slice(2);
+  if(!_mIds.has(id)||_mBad.has(id))return "";
+  const u=_mUrl.get(k);if(u)return u;
+  mSchedule();return mPh(k); // Platzhalter, wird beim Sichtbarwerden ersetzt
+}
 /* MU = Adresse fuer die Anzeige in Kacheln (Vorschau, sonst Original) */
-function MU(v){if(!isMRef(v))return v||"";const id=mId(v);return _mThumb.get(id)||_mFull.get(id)||"";}
+function MU(v){if(!isMRef(v))return v||"";const id=mId(v);return mGetUrl((_mThumbIds.has(id)?"t:":"f:")+id);}
 /* MF = Adresse des Originals */
-function MF(v){if(!isMRef(v))return v||"";return _mFull.get(mId(v))||"";}
-function mBlobOf(r){if(!r)return null;if(r.blob instanceof Blob)return r.blob;if(r.buf)return new Blob([r.buf],{type:r.type||""});return null;}
+function MF(v){if(!isMRef(v))return v||"";return mGetUrl("f:"+mId(v));}
+function mRecBlob(r){if(!r)return null;if(r instanceof Blob)return r;if(r.buf)return new Blob([r.buf],{type:r.type||""});if(r.blob instanceof Blob)return r.blob;return null;}
 function mNewId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,9);}
 function mSize(b){b=b||0;if(b>=1073741824)return (b/1073741824).toFixed(1).replace(".",",")+" GB";if(b>=1048576)return (b/1048576).toFixed(1).replace(".",",")+" MB";if(b>=1024)return Math.round(b/1024)+" KB";return b+" B";}
 function mExt(type,name){const m=/\.([a-z0-9]{1,6})$/i.exec(name||"");if(m)return m[1].toLowerCase();const t=String(type||"").split("/")[1]||"";return (t.replace("jpeg","jpg").replace("svg+xml","svg").replace(/[^a-z0-9]/gi,"").slice(0,6)||"bin").toLowerCase();}
@@ -870,18 +884,119 @@ function idbPutState(json){
   }catch(e){return Promise.reject(e);}
 }
 function mHasStores(){try{return !!(_db&&_db.objectStoreNames.contains(MSTORE)&&_db.objectStoreNames.contains(TSTORE));}catch(e){return false;}}
+/* Beim Start nur die Liste der vorhandenen Dateien lesen — keine Bilddaten */
 async function mediaInit(){
   _mediaOK=false;
   if(!mHasStores())return false;
   try{
     const tx=_db.transaction([MSTORE,TSTORE],"readonly");
-    const ms=tx.objectStore(MSTORE),ts=tx.objectStore(TSTORE);
-    const r=await Promise.all([idbReq(ms.getAllKeys()),idbReq(ms.getAll()),idbReq(ts.getAllKeys()),idbReq(ts.getAll())]);
-    r[0].forEach((id,i)=>{const b=mBlobOf(r[1][i]);if(b)_mFull.set(id,URL.createObjectURL(b));});
-    r[2].forEach((id,i)=>{if(r[3][i] instanceof Blob)_mThumb.set(id,URL.createObjectURL(r[3][i]));});
+    const r=await Promise.all([idbReq(tx.objectStore(MSTORE).getAllKeys()),idbReq(tx.objectStore(TSTORE).getAllKeys())]);
+    r[0].forEach(id=>_mIds.add(id));r[1].forEach(id=>_mThumbIds.add(id));
     _mediaOK=true;
   }catch(e){_mediaOK=false;}
   return _mediaOK;
+}
+function mReadRec(store,id){
+  return new Promise((res,rej)=>{try{const q=_db.transaction(store,"readonly").objectStore(store).get(id);q.onsuccess=()=>res(q.result||null);q.onerror=()=>rej(q.error);}catch(e){rej(e);}});
+}
+/* Aeltere Eintraege (als Blob gespeichert) beim Lesen auf reine Bytes umschreiben */
+function mRewrite(kind,id,rec,buf,type){
+  try{
+    const st=kind==="t"?TSTORE:MSTORE,tx=_db.transaction(st,"readwrite");
+    tx.objectStore(st).put(kind==="t"?{buf:buf,type:type}:{buf:buf,type:(rec&&rec.type)||type||"",name:(rec&&rec.name)||"",size:buf.byteLength,t:(rec&&rec.t)||Date.now()},id);
+  }catch(e){}
+}
+function mCacheSet(k,blob){
+  const old=_mUrl.get(k);if(old){try{URL.revokeObjectURL(old);}catch(_){}}
+  const u=URL.createObjectURL(blob);_mUrl.set(k,u);_mBytes.set(k,blob.size||0);mTrim();return u;
+}
+/* Arbeitsspeicher begrenzen: Bilder, die gerade nirgends angezeigt werden, wieder freigeben */
+function mTrim(){
+  let tot=0;_mBytes.forEach(b=>{tot+=b;});
+  if(tot<=M_CACHE_MAX)return;
+  for(const [k,u] of Array.from(_mUrl)){
+    if(tot<=M_CACHE_MAX*0.75)break;
+    if(document.querySelector('[src="'+u+'"],[href="'+u+'"]'))continue;
+    try{URL.revokeObjectURL(u);}catch(_){}
+    tot-=(_mBytes.get(k)||0);_mUrl.delete(k);_mBytes.delete(k);
+  }
+}
+function mTimeout(p,ms){return Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),ms))]);}
+function mLoad(k){
+  if(_mUrl.has(k))return Promise.resolve(_mUrl.get(k));
+  if(_mJobs.has(k))return _mJobs.get(k);
+  const kind=k[0],id=k.slice(2);
+  const job=(async()=>{
+    const rec=await mReadRec(kind==="t"?TSTORE:MSTORE,id);
+    let blob=mRecBlob(rec);
+    if(!blob)throw new Error("fehlt");
+    if(!(rec&&rec.buf)){
+      // aelteres Format: pruefen, ob lesbar (Safari!), und auf reine Bytes umstellen
+      const buf=await mTimeout(blob.arrayBuffer(),8000);
+      const type=blob.type||(rec&&rec.type)||"";
+      blob=new Blob([buf],{type:type});
+      mRewrite(kind,id,rec,buf,type);
+    }
+    return mCacheSet(k,blob);
+  })().catch(()=>{
+    if(kind==="t"){_mThumbIds.delete(id);return mLoad("f:"+id);} // Vorschau defekt -> Original nehmen
+    _mBad.add(id);mBadNotice();return "";
+  }).finally(()=>{_mJobs.delete(k);});
+  _mJobs.set(k,job);
+  return job;
+}
+/* Platzhalter im Dokument suchen und laden, sobald sie in die Naehe des
+   sichtbaren Bereichs kommen (beim Anzeigen, Scrollen, Klicken und zur
+   Sicherheit alle 1,5 Sekunden — die Suche selbst kostet kaum Zeit) */
+let _mScanT=0;
+function mSchedule(){if(_mScanT)return;_mScanT=setTimeout(mScan,0);}
+function mScan(){
+  _mScanT=0;
+  const els=document.querySelectorAll('img[src^="'+M_PH+'#"],a[href^="'+M_PH+'#"]');
+  if(!els.length)return;
+  const vh=window.innerHeight||900,M=1200;
+  els.forEach(el=>{
+    if(el.tagName==="A"){mFill(el);return;}
+    const r=el.getBoundingClientRect();
+    if(!r.width&&!r.height)return; // gerade unsichtbar (eingeklappt o. ae.) — spaeter erneut
+    if(r.bottom>-M&&r.top<vh+M)mFill(el);
+  });
+}
+document.addEventListener("scroll",()=>mSchedule(),{capture:true,passive:true});
+window.addEventListener("resize",()=>mSchedule());
+document.addEventListener("click",()=>setTimeout(mSchedule,40),true);
+setInterval(()=>{if(document.visibilityState!=="hidden")mSchedule();},1500);
+function mFill(el){
+  const at=el.tagName==="A"?"href":"src",v=el.getAttribute(at)||"",i=v.indexOf("#");
+  if(i<0||v.slice(0,i)!==M_PH)return;
+  const k=v.slice(i+1),ph=mPh(k);
+  mLoad(k).then(u=>{
+    document.querySelectorAll('[src="'+ph+'"],[href="'+ph+'"]').forEach(x=>{
+      const a=x.tagName==="A"?"href":"src";
+      if(u)x.setAttribute(a,u);else if(a==="src")x.classList.add("m-missing");
+    });
+  });
+}
+/* Klick auf einen Datei-Link, der noch nicht bereit ist: kurz laden, dann ausfuehren */
+document.addEventListener("click",function(e){
+  const a=e.target&&e.target.closest&&e.target.closest('a[href^="'+M_PH+'#"]');
+  if(!a)return;
+  e.preventDefault();e.stopPropagation();
+  const k=a.getAttribute("href").split("#")[1];
+  mLoad(k).then(u=>{if(u){a.setAttribute("href",u);a.click();}else toast("Datei nicht gefunden.");});
+},true);
+let _mBadT=0;
+function mBadNotice(){
+  clearTimeout(_mBadT);
+  _mBadT=setTimeout(()=>{
+    const n=_mBad.size;if(!n)return;
+    showBanner("bad",(n===1?"1 Bild konnte":n+" Bilder konnten")+" nicht gelesen werden – bitte das Backup erneut laden","Backup laden",pickBackupFile,"Später",null);
+  },900);
+}
+function pickBackupFile(){
+  const inp=document.createElement("input");inp.type="file";inp.style.display="none";document.body.appendChild(inp);
+  inp.addEventListener("change",()=>{const f=inp.files&&inp.files[0];inp.remove();if(f)importBackup(f);});
+  inp.click();
 }
 /* ── Vorschaubilder ── */
 function mDecodeImg(blob){
@@ -929,19 +1044,17 @@ async function mMakeThumb(blob){
 }
 /* ── Ablegen ── */
 let _mQueue=Promise.resolve(),_mPending=0;
-function mWrite(id,rec,thumb){const tx=_db.transaction([MSTORE,TSTORE],"readwrite");tx.objectStore(MSTORE).put(rec,id);if(thumb)tx.objectStore(TSTORE).put(thumb,id);return idbDone(tx);}
+function mWrite(id,rec,thumbRec){const tx=_db.transaction([MSTORE,TSTORE],"readwrite");tx.objectStore(MSTORE).put(rec,id);if(thumbRec)tx.objectStore(TSTORE).put(thumbRec,id);return idbDone(tx);}
 async function mediaPutNow(blob,name){
   if(!_mediaOK||!_db)throw new Error("nomedia");
   const id=mNewId(),type=blob.type||"",nm=name||blob.name||"";
+  const buf=await blob.arrayBuffer();
   const thumb=await mMakeThumb(blob);
-  try{await mWrite(id,{blob:blob,type:type,name:nm,size:blob.size||0,t:Date.now()},thumb);}
-  catch(e){
-    if(e&&e.name==="QuotaExceededError")throw e;
-    // Ersatzweg fuer Browser, die Dateien nicht direkt ablegen koennen
-    await mWrite(id,{buf:await blob.arrayBuffer(),type:type,name:nm,size:blob.size||0,t:Date.now()},thumb);
-  }
-  _mFull.set(id,URL.createObjectURL(blob));
-  if(thumb)_mThumb.set(id,URL.createObjectURL(thumb));
+  const tRec=thumb?{buf:await thumb.arrayBuffer(),type:thumb.type||"image/jpeg"}:null;
+  await mWrite(id,{buf:buf,type:type,name:nm,size:buf.byteLength,t:Date.now()},tRec);
+  _mIds.add(id);_mBad.delete(id);
+  mCacheSet("f:"+id,blob);
+  if(thumb){_mThumbIds.add(id);mCacheSet("t:"+id,thumb);}
   return MREF+id;
 }
 function mediaPut(blob,name){const job=_mQueue.then(()=>mediaPutNow(blob,name));_mQueue=job.catch(()=>{});return job;}
@@ -992,14 +1105,14 @@ async function mediaGC(){
   const used=mCollectRefs(S,new Set());
   let seen={};try{seen=JSON.parse(localStorage.getItem(ORPHAN_KEY)||"{}")||{};}catch(e){return;}
   const now=Date.now(),del=[],keep={};
-  _mFull.forEach((u,id)=>{if(used.has(id))return;const t=seen[id]||now;if(now-t>ORPHAN_DAYS*864e5)del.push(id);else keep[id]=t;});
+  _mIds.forEach(id=>{if(used.has(id))return;const t=seen[id]||now;if(now-t>ORPHAN_DAYS*864e5)del.push(id);else keep[id]=t;});
   try{localStorage.setItem(ORPHAN_KEY,JSON.stringify(keep));}catch(e){return;}
   if(!del.length)return;
   try{
     const tx=_db.transaction([MSTORE,TSTORE],"readwrite");
     del.forEach(id=>{tx.objectStore(MSTORE).delete(id);tx.objectStore(TSTORE).delete(id);});
     await idbDone(tx);
-    del.forEach(id=>{[_mFull,_mThumb].forEach(m=>{const u=m.get(id);if(u){try{URL.revokeObjectURL(u);}catch(_){}m.delete(id);}});});
+    del.forEach(id=>{_mIds.delete(id);_mThumbIds.delete(id);["f:","t:"].forEach(p=>{const u=_mUrl.get(p+id);if(u){try{URL.revokeObjectURL(u);}catch(_){}_mUrl.delete(p+id);_mBytes.delete(p+id);}});});
   }catch(e){}
 }
 async function mediaHousekeeping(){
@@ -1026,9 +1139,10 @@ function showBusy(txt,i,n){
 }
 function hideBusy(){const b=$("mfnBusy");if(b)b.classList.remove("show");}
 let _bannerKind=null;
+const BANNER_RANK={update:3,bad:2,backup:1};
 function showBanner(kind,txt,goLbl,go,laterLbl,later){
   const b=$("mfnBanner");if(!b)return;
-  if(_bannerKind==="update"&&kind!=="update")return; // Update-Hinweis hat Vorrang
+  if(_bannerKind&&(BANNER_RANK[_bannerKind]||0)>(BANNER_RANK[kind]||0))return; // Wichtigeres bleibt stehen
   _bannerKind=kind;
   $("mfnBannerTxt").textContent=txt;
   const g=$("mfnBannerGo"),l=$("mfnBannerLater");
@@ -1086,18 +1200,26 @@ function mReadMany(ids){
     }catch(e){rej(e);}
   });
 }
+/* Liefert die Datei nur, wenn sie wirklich lesbar ist (Safari-Altdaten koennen defekt sein) */
+async function mReadable(r){
+  const b=mRecBlob(r);if(!b)return null;
+  if(r.buf)return b;
+  try{await mTimeout(b.slice(0,1).arrayBuffer(),8000);return b;}catch(e){return null;}
+}
 async function buildBackupBlob(){
   const used=Array.from(mCollectRefs(S,new Set()));
   const got=(used.length&&mHasStores())?await mReadMany(used):new Map();
   const media={},files=[];
-  used.forEach(id=>{
-    const g=got.get(id),b=g&&mBlobOf(g.rec);if(!b)return;
+  for(const id of used){
+    const g=got.get(id);if(!g)continue;
+    const b=await mReadable(g.rec);if(!b)continue;
     const file="media/"+id+"."+mExt(g.rec.type||b.type,g.rec.name);
     let thumb=null;
-    if(g.thumb instanceof Blob){thumb="thumbs/"+id+"."+mExt(g.thumb.type,"");files.push([thumb,g.thumb]);}
+    const tb=g.thumb?await mReadable(g.thumb):null;
+    if(tb){thumb="thumbs/"+id+"."+mExt(tb.type,"");files.push([thumb,tb]);}
     media[id]={name:g.rec.name||"",type:g.rec.type||b.type||"",size:b.size,file:file,thumb:thumb};
     files.push([file,b]);
-  });
+  }
   const count=Object.keys(media).length;
   const man={format:"mfn-studio-backup",version:1,created:new Date().toISOString(),app:APP_VERSION,state:S,media:media,missing:used.length-count};
   const parts=[],t=Date.now();
@@ -1116,10 +1238,14 @@ async function exportBackup(){
     const url=URL.createObjectURL(r.blob);
     const a=document.createElement("a");a.href=url;a.download=fname;a.rel="noopener";document.body.appendChild(a);a.click();a.remove();
     setTimeout(()=>{try{URL.revokeObjectURL(url);}catch(e){}},10*60*1000);
-    try{localStorage.setItem(BK_LAST,String(Date.now()));localStorage.removeItem(BK_SNOOZE);}catch(e){}
     hideBusy();
-    if(_bannerKind==="backup")hideBanner();
-    toast(r.missing?("Backup gespeichert – "+r.missing+" Datei(en) fehlten"):("Backup gespeichert · "+mSize(r.blob.size)));
+    if(r.missing){
+      toast("Achtung: "+r.missing+" Datei(en) waren nicht lesbar – ältere Backups bitte aufbewahren");
+    }else{
+      try{localStorage.setItem(BK_LAST,String(Date.now()));localStorage.removeItem(BK_SNOOZE);}catch(e){}
+      if(_bannerKind==="backup")hideBanner();
+      toast("Backup gespeichert · "+mSize(r.blob.size));
+    }
     fillBackupInfo();
   }catch(e){hideBusy();toast("Backup fehlgeschlagen");}
 }
@@ -1138,17 +1264,18 @@ async function importBackup(file){
   const when=man.created?new Date(man.created).toLocaleString("de-DE",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"}):"unbekannt";
   if(!confirm("Backup vom "+when+" laden?\n\n"+(ids.length===1?"1 Bild bzw. Datei":ids.length+" Bilder & Dateien")+"\n\nAlle aktuellen Inhalte des Dashboards in diesem Browser werden durch das Backup ersetzt."))return;
   const byName=new Map(entries.map(e=>[e.name,e]));
-  const slice=(e,type)=>file.slice(e.start,e.start+e.size,type||"");
+  const part=e=>file.slice(e.start,e.start+e.size).arrayBuffer();
+  const thumbType=p=>/\.png$/.test(p)?"image/png":(/\.webp$/.test(p)?"image/webp":"image/jpeg");
   showBusy("Backup wird geladen …",0,ids.length);
   try{
     for(let i=0;i<ids.length;i++){
       const id=ids[i],m=man.media[id],fe=m&&byName.get(m.file);
       if(fe){
+        const buf=await part(fe);
         const te=m.thumb?byName.get(m.thumb):null;
-        const blob=slice(fe,m.type),thumb=te?slice(te,/\.png$/.test(m.thumb)?"image/png":(/\.webp$/.test(m.thumb)?"image/webp":"image/jpeg")):null;
-        const rec={blob:blob,type:m.type||"",name:m.name||"",size:blob.size,t:Date.now()};
-        try{await mWrite(id,rec,thumb);}
-        catch(err){if(err&&err.name==="QuotaExceededError")throw err;await mWrite(id,{buf:await blob.arrayBuffer(),type:rec.type,name:rec.name,size:rec.size,t:rec.t},thumb);}
+        const tRec=te?{buf:await part(te),type:thumbType(m.thumb)}:null;
+        await mWrite(id,{buf:buf,type:m.type||"",name:m.name||"",size:buf.byteLength,t:Date.now()},tRec);
+        if(!tRec){try{const tx=_db.transaction(TSTORE,"readwrite");tx.objectStore(TSTORE).delete(id);await idbDone(tx);}catch(_){}}
       }
       showBusy("Backup wird geladen …",i+1,ids.length);
     }
@@ -1163,7 +1290,7 @@ async function importBackup(file){
 }
 function lastBackupTime(){try{return parseInt(localStorage.getItem(BK_LAST)||"0",10)||0;}catch(e){return 0;}}
 function backupReminder(){
-  if(!_mFull.size)return;
+  if(!_mIds.size)return;
   let snooze=0;try{snooze=parseInt(localStorage.getItem(BK_SNOOZE)||"0",10)||0;}catch(e){return;}
   const now=Date.now(),last=lastBackupTime();
   if(now-last<BK_DAYS*864e5||now<snooze)return;
@@ -1176,6 +1303,7 @@ async function fillBackupInfo(){
   parts.push(last?("Letztes Backup: "+new Date(last).toLocaleString("de-DE",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"})):"Noch kein Backup gespeichert");
   const n=mCollectRefs(S,new Set()).size;
   parts.push(n===1?"1 Bild bzw. Datei im Dashboard":n+" Bilder & Dateien im Dashboard");
+  if(_mBad.size)parts.push("Achtung: "+_mBad.size+" davon nicht lesbar – bitte Backup erneut laden");
   try{if(navigator.storage&&navigator.storage.estimate){const est=await navigator.storage.estimate();if(est&&est.usage)parts.push("Belegter Speicher: ca. "+mSize(est.usage));}}catch(e){}
   try{if(navigator.storage&&navigator.storage.persisted){const p=await navigator.storage.persisted();parts.push(p?"Vom Browser vor automatischem Löschen geschützt":"Schutz vor automatischem Löschen: vom Browser noch nicht bestätigt");}}catch(e){}
   if(!_mediaOK)parts.push("Hinweis: Browser-Speicher eingeschränkt – Bilder werden im alten Format gespeichert");
@@ -2068,8 +2196,8 @@ function prodDocOpen(d,download){
   if(!d||!d.data)return;
   try{
     const own=!isMRef(d.data);
-    const url=own?URL.createObjectURL(dataUrlToBlob(d.data)):MF(d.data);
-    if(!url){toast("Datei nicht gefunden.");return;}
+    const url=own?URL.createObjectURL(dataUrlToBlob(d.data)):(_mUrl.get("f:"+mId(d.data))||"");
+    if(!url){if(!own&&_mIds.has(mId(d.data))){mLoad("f:"+mId(d.data)).then(u=>{if(u)prodDocOpen(d,download);else toast("Datei nicht gefunden.");});return;}toast("Datei nicht gefunden.");return;}
     const a=document.createElement("a");a.href=url;
     if(download)a.download=d.name||"Datei";else a.target="_blank";
     a.rel="noopener";document.body.appendChild(a);a.click();a.remove();
@@ -2082,6 +2210,7 @@ function bindProdEvents(){
   m.querySelectorAll("[data-prtab]").forEach(el=>el.addEventListener("click",function(){S.prodCat=this.dataset.prtab;save();render();}));
   m.querySelectorAll("[data-prpiece]").forEach(el=>el.addEventListener("click",function(){S.prodPiece[S.prodCat]=parseInt(this.dataset.prpiece);save();render();}));
   const e=prodEntry(sea,cat,cur);
+  (e.docs||[]).forEach(d=>{if(isMRef(d.data)&&_mIds.has(mId(d.data)))mLoad("f:"+mId(d.data));});
   const titleInp=$("prodTitleInput");
   if(titleInp){
     titleInp.addEventListener("input",function(){
